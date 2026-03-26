@@ -20,6 +20,7 @@ import threading
 import time
 import typing
 import urllib.parse
+import os
 
 if typing.TYPE_CHECKING:
     from librespot.core import Session
@@ -233,8 +234,28 @@ class AudioKeyManager(PacketsReceiver, Closeable):
     __session: Session
     __zero_short = b"\x00\x00"
 
+    get_audio_key_retries: int = 0
+    get_audio_key_retry_after: int = 0
+
     def __init__(self, session: Session):
         self.__session = session
+
+        retries = os.getenv("GET_AUDIO_KEY_RETRIES")
+        if retries is not None:
+            self.logger.info(f"Setting get_audio_key_retries to {retries}")
+            self.get_audio_key_retries = int(retries)
+
+        else:
+            self.logger.info(f"Using default get_audio_key_retries: {self.get_audio_key_retries}")
+      
+        retry_after = os.getenv("GET_AUDIO_KEY_RETRY_AFTER")
+
+        if retry_after is not None:
+            self.logger.info(f"Setting get_audio_key_retry_after to {retry_after}")
+            self.get_audio_key_retry_after = int(retry_after)
+            
+        else:
+            self.logger.info(f"Using default get_audio_key_retry_after: {self.get_audio_key_retry_after}")
 
     def dispatch(self, packet: Packet) -> None:
         payload = io.BytesIO(packet.payload)
@@ -258,7 +279,14 @@ class AudioKeyManager(PacketsReceiver, Closeable):
     def get_audio_key(self,
                       gid: bytes,
                       file_id: bytes,
-                      retry: bool = True) -> bytes:
+                      retries_remaining: int = None,
+                      retry_after: int = None) -> bytes:
+        
+        if retries_remaining is None:
+            retries_remaining = self.get_audio_key_retries
+        if retry_after is None:
+            retry_after = self.get_audio_key_retry_after
+            
         seq: int
         with self.__seq_holder_lock:
             seq = self.__seq_holder
@@ -274,8 +302,11 @@ class AudioKeyManager(PacketsReceiver, Closeable):
         self.__callbacks[seq] = callback
         key = callback.wait_response()
         if key is None:
-            if retry:
-                return self.get_audio_key(gid, file_id, False)
+            if retries_remaining > 0:
+                self.logger.warning(f"Failed fetching audio key, retries remaining: {retries_remaining}")
+
+                time.sleep(retry_after)
+                return self.get_audio_key(gid, file_id, retries_remaining - 1, retry_after * 2)
             raise RuntimeError(
                 "Failed fetching audio key! gid: {}, fileId: {}".format(
                     util.bytes_to_hex(gid), util.bytes_to_hex(file_id)))
